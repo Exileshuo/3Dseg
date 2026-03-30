@@ -227,7 +227,7 @@ class BraTS2020Dataset(Dataset):
 
 
 # ==========================================
-# 4. 后处理：临床解剖学级联约束
+# 4. 后处理：临床解剖学级联约束 (剔除激进规则)
 # ==========================================
 def predict_with_tta(model, img_tensor):
     probs = torch.sigmoid(model(img_tensor))
@@ -273,15 +273,18 @@ def advanced_refine(prob_map, threshold=0.5, constrain_mask=None, min_volume=0):
 # 5. 主控流水线
 # ==========================================
 def run_all():
+    # 🌟 强制精准定位数据目录
     DATA_DIR = Path("data/BraTS2020_TrainingData/MICCAI_BraTS2020_TrainingData")
-    BEST_MODEL = "./saved_models/nirvana_hybrid_best.pth"
+    if not DATA_DIR.exists():
+        DATA_DIR = Path("data/BraTS2020_TrainingData")
+
+    BEST_MODEL = "./saved_models/nirvana_hybrid_best.pth"  # 沿用你已有的满级权重
     SPLIT_RECORD = "./saved_models/test_split.txt"
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     LOG_DIR = "./logs"
-    TB_DIR = f"./runs/brats_nirvana_{timestamp}"
+    TB_DIR = f"./runs/brats_nirvana_final_{timestamp}"
 
-    # 🌟 在刚开始和每次使用前确保目录存在
     os.makedirs("./saved_models", exist_ok=True)
     os.makedirs(LOG_DIR, exist_ok=True)
 
@@ -290,10 +293,15 @@ def run_all():
     model = StableHybrid3DUNet().to(device)
     criterion = DiceFocalBoundaryLoss(weights=[1.0, 1.5, 3.0], boundary_weight=0.1).to(device)
 
-    if not DATA_DIR.exists(): return
+    print(f"👉 正在扫描数据目录: {DATA_DIR.absolute()}")
+    if not DATA_DIR.exists():
+        print(f"❌ 找不到数据目录，请检查路径！")
+        return
 
     all_cases = [d for d in DATA_DIR.iterdir() if d.is_dir()]
-    if len(all_cases) == 0: return
+    if len(all_cases) == 0:
+        print("❌ 目录内无病人文件夹！")
+        return
 
     if not os.path.exists(BEST_MODEL):
         print("\n🚨 准备开启 [Res-SE + 解剖学约束] 的巅峰突破...")
@@ -316,7 +324,6 @@ def run_all():
         tb_writer = SummaryWriter(log_dir=TB_DIR)
         train_csv_path = f"{LOG_DIR}/train_log_{timestamp}.csv"
 
-        # 🌟 绝对防御机制
         os.makedirs(LOG_DIR, exist_ok=True)
         with open(train_csv_path, mode='w', newline='') as f:
             csv.writer(f).writerow(['Epoch', 'Train_Loss', 'Val_WT_Dice'])
@@ -367,17 +374,16 @@ def run_all():
                     torch.save(model.state_dict(), BEST_MODEL)
                     tqdm.write("🌟 已保存涅槃版最优权重！")
 
-            # 🌟 每次追加记录前，都确保文件夹存在
             os.makedirs(LOG_DIR, exist_ok=True)
             with open(train_csv_path, mode='a', newline='') as f:
                 csv.writer(f).writerow([epoch, f"{avg_train_loss:.4f}", current_val_dice])
 
         tb_writer.close()
     else:
-        print(f"✅ 检测到历史权重，执行评估！")
+        print(f"✅ 检测到历史最优权重，直接跳过训练，执行纯粹的黄金阈值评估！")
 
     # --- B. 执行评估 ---
-    print("\n🚀 启动终极解剖学级联评估...")
+    print("\n🚀 启动终极解剖学级联评估 (搭载黄金阈值)...")
     model.load_state_dict(torch.load(BEST_MODEL, map_location=device))
     model.eval()
 
@@ -392,7 +398,7 @@ def run_all():
     results = {'WT': [], 'TC': [], 'ET': []}
     bad_cases = []
 
-    test_csv_path = f"{LOG_DIR}/test_results_nirvana_{timestamp}.csv"
+    test_csv_path = f"{LOG_DIR}/test_results_nirvana_final_pure_{timestamp}.csv"
     csv_rows = [['Case_ID', 'WT_Dice', 'WT_HD95', 'TC_Dice', 'TC_HD95', 'ET_Dice', 'ET_HD95']]
 
     with torch.no_grad():
@@ -404,9 +410,12 @@ def run_all():
             prob = predict_with_tta(model, imgs)
             gt = masks.numpy().squeeze()
 
-            wt_p = advanced_refine(prob[0], threshold=0.5, min_volume=200)
-            tc_p = advanced_refine(prob[1], threshold=0.5, constrain_mask=wt_p, min_volume=100)
-            et_p = advanced_refine(prob[2], threshold=0.65, constrain_mask=tc_p, min_volume=50)
+            # ======================================================
+            # 🏆 纯粹的黄金阈值级联约束 (撤销了激进的误杀规则)
+            # ======================================================
+            wt_p = advanced_refine(prob[0], threshold=0.50, min_volume=200)
+            tc_p = advanced_refine(prob[1], threshold=0.55, constrain_mask=wt_p, min_volume=100)
+            et_p = advanced_refine(prob[2], threshold=0.70, constrain_mask=tc_p, min_volume=50)
 
             preds = [wt_p, tc_p, et_p]
             case_metrics = []
@@ -437,7 +446,7 @@ def run_all():
         csv.writer(f).writerows(csv_rows)
 
     print("\n" + "=" * 50)
-    print("🎯 Res-SE 涅槃版 终极评估报告")
+    print("🎯 Res-SE 涅槃版 终极评估报告 (黄金阈值锁死版)")
     for k in ['WT', 'TC', 'ET']:
         arr = np.array(results[k])
         print(f"{k:<3} -> Dice: {np.mean(arr[:, 0]):.4f} | HD95: {np.mean(arr[:, 1]):.2f}")
